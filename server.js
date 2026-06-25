@@ -1,0 +1,312 @@
+import express from 'express';
+import { Pool } from 'pg';
+
+const app = express();
+app.use(express.json({ limit: '25mb' }));
+const PORT = process.env.PORT || 10000;
+const BOT_TOKEN = process.env.BOT_TOKEN || '';
+const OWNER_ID = String(process.env.OWNER_ID || '');
+const SECRET_TOKEN = process.env.SECRET_TOKEN || 'my_secret_123';
+const VIEWER_KEY = process.env.VIEWER_KEY || SECRET_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const MAX = Number(process.env.MAX_MESSAGES_PER_DIALOG || 3000);
+const REPORT_MESSAGES = String(process.env.REPORT_MESSAGES || '1') !== '0';
+
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: DATABASE_URL ? { rejectUnauthorized:false } : false, max: 6 });
+let ready = initDb();
+async function initDb(){
+  if(!DATABASE_URL) { console.log('DATABASE_URL missing'); return; }
+  await pool.query(`CREATE TABLE IF NOT EXISTS business_connections(id text primary key,is_enabled boolean,user_id text,user_name text,user_short text,user_chat_id text,date_ts bigint,rights jsonb,saved_at bigint);`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS dialogs(id text primary key,short_id text unique,business_connection_id text,chat_id text,title text,short_title text,owner jsonb,peer jsonb,notified boolean default false,created_at bigint,updated_at bigint);`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS messages(dialog_id text not null,message_id text not null,side text,from_id text,author text,author_full text,to_id text,to_name text,text text,plain text,date_ts bigint,time_text text,edited boolean default false,edit_date bigint,old_text text,deleted boolean default false,media jsonb,reply jsonb,raw_type text,saved_at bigint,primary key(dialog_id,message_id));`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS restored_media_events(event_key text primary key, created_at bigint);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_dialogs_updated ON dialogs(updated_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_message ON messages(message_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_dialog ON messages(dialog_id,date_ts,message_id);`);
+  console.log('✅ Database ready');
+}
+async function q(sql,p=[]){ await ready; return pool.query(sql,p); }
+function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+function attr(s){return esc(s).replaceAll('"','&quot;')}
+function json(res,d,st=200){return res.status(st).set('Cache-Control','no-store').json(d)}
+function html(res,t,st=200){return res.status(st).set('Content-Type','text/html; charset=utf-8').set('Cache-Control','no-store').send(t)}
+function now(){return Date.now()} function unix(){return Math.floor(Date.now()/1000)}
+function line(){return '━━━━━━━━━━━━━━'}
+function fmt(ts){ if(!ts) return 'неизвестно'; return new Intl.DateTimeFormat('ru-RU',{timeZone:'Asia/Tashkent',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(Number(ts)*1000)).replace(',',' •') }
+function fmtNow(){ return new Intl.DateTimeFormat('ru-RU',{timeZone:'Asia/Tashkent',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date()).replace(',',' •') }
+function origin(req){return `${req.headers['x-forwarded-proto']||req.protocol||'https'}://${req.headers['x-forwarded-host']||req.headers.host}`}
+function okKey(req){return req.query.key && String(req.query.key)===String(VIEWER_KEY)}
+async function tg(method,payload){ const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const t=await r.text(); if(!r.ok) console.log('TG error',method,r.status,t); try{return JSON.parse(t)}catch{return{ok:false,raw:t}} }
+async function send(chat_id,text){ if(!chat_id) return; return tg('sendMessage',{chat_id,text:String(text).slice(0,3900),parse_mode:'HTML',disable_web_page_preview:true}) }
+async function owner(text){ if(OWNER_ID) return send(OWNER_ID,text) }
+function uname(u){ if(!u) return 'unknown'; let n=[u.first_name,u.last_name].filter(Boolean).join(' '); if(u.username) n+=` (@${u.username})`; return n || String(u.id||'unknown') }
+function shortUser(u){ if(!u) return 'unknown'; if(u.username) return `@${u.username}`; const n=[u.first_name,u.last_name].filter(Boolean).join(' '); return n ? `${n} (ID:${u.id||'unknown'})` : `ID:${u.id||'unknown'}` }
+function cname(c){ if(!c) return 'unknown'; let n=c.title || [c.first_name,c.last_name].filter(Boolean).join(' '); if(c.username) n+=` (@${c.username})`; return n || String(c.id||'unknown') }
+function shortChat(c){ if(!c) return 'unknown'; if(c.username) return `@${c.username}`; const n=c.title || [c.first_name,c.last_name].filter(Boolean).join(' '); return n ? `${n} (ID:${c.id||'unknown'})` : `ID:${c.id||'unknown'}` }
+function fallbackOwner(){return 'Business аккаунт'}
+function isPrivate(c){return c&&c.type==='private'}
+function isBusiness(m){return Boolean(m.business_connection_id)}
+function textOf(m){ if(m.text) return m.text; if(m.caption) return m.caption; if(m.photo) return '[🖼 фото]'; if(m.video) return '[🎬 видео]'; if(m.document) return `[📄 документ / файл${m.document.file_name?': '+m.document.file_name:''}]`; if(m.voice) return '[🎤 голосовое сообщение]'; if(m.video_note) return '[⭕ видеосообщение / кружочек]'; if(m.sticker) return `[🌟 стикер${m.sticker.emoji?' '+m.sticker.emoji:''}]`; if(m.animation) return '[🎞 GIF / анимация]'; if(m.audio) return '[🎧 аудио]'; return '[сообщение без текста]' }
+function mediaOf(m){
+  if(m.photo?.length){let x=m.photo[m.photo.length-1];return{type:'photo',file_id:x.file_id,label:'Фото',file_name:'',mime_type:'image/jpeg'}}
+  if(m.video?.file_id)return{type:'video',file_id:m.video.file_id,label:'Видео',file_name:m.video.file_name||'',mime_type:m.video.mime_type||'video/mp4'};
+  if(m.document?.file_id)return{type:'document',file_id:m.document.file_id,label:'Документ',file_name:m.document.file_name||'',mime_type:m.document.mime_type||''};
+  if(m.animation?.file_id)return{type:'animation',file_id:m.animation.file_id,label:'GIF',file_name:m.animation.file_name||'',mime_type:m.animation.mime_type||'video/mp4'};
+  if(m.audio?.file_id)return{type:'audio',file_id:m.audio.file_id,label:'Аудио',file_name:m.audio.file_name||m.audio.title||'',mime_type:m.audio.mime_type||'audio/mpeg'};
+  if(m.voice?.file_id)return{type:'voice',file_id:m.voice.file_id,label:'Голосовое',file_name:'',mime_type:m.voice.mime_type||'audio/ogg'};
+  if(m.video_note?.file_id)return{type:'video_note',file_id:m.video_note.file_id,label:'Кружок',file_name:'',mime_type:'video/mp4'};
+  if(m.sticker?.file_id)return{type:'sticker',file_id:m.sticker.file_id,label:`Стикер${m.sticker.emoji?' '+m.sticker.emoji:''}`,file_name:'',mime_type:m.sticker.is_animated?'application/x-tgsticker':'image/webp'};
+  return null;
+}
+function replyOf(m){return m.reply_to_message?{message_id:m.reply_to_message.message_id||null,author:shortUser(m.reply_to_message.from),text:textOf(m.reply_to_message)}:null}
+function did(m){return `${m.business_connection_id||'normal'}:${m.chat?.id||'unknown_chat'}`}
+function sid(){return Math.random().toString(36).slice(2,6)+Date.now().toString(36).slice(-4)}
+async function saveConn(c){ const u=c.user||{}; await q(`insert into business_connections(id,is_enabled,user_id,user_name,user_short,user_chat_id,date_ts,rights,saved_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict(id) do update set is_enabled=excluded.is_enabled,user_id=excluded.user_id,user_name=excluded.user_name,user_short=excluded.user_short,user_chat_id=excluded.user_chat_id,date_ts=excluded.date_ts,rights=excluded.rights,saved_at=excluded.saved_at`,[c.id,!!c.is_enabled,String(u.id||''),uname(u),shortUser(u),String(c.user_chat_id||''),c.date||null,JSON.stringify(c.rights||null),now()]) }
+async function getOwner(connectionId){ if(!connectionId)return null; let r=await q('select * from business_connections where id=$1',[connectionId]); if(!r.rows[0]){ const g=await tg('getBusinessConnection',{business_connection_id:connectionId}); if(g?.ok&&g.result){ await saveConn(g.result); r=await q('select * from business_connections where id=$1',[connectionId]); } } const x=r.rows[0]; if(!x)return null; return{id:x.user_id||'',name:x.user_name||fallbackOwner(),shortName:x.user_short||x.user_name||fallbackOwner(),chatId:x.user_chat_id||''} }
+async function dirOf(m){ const chat=m.chat||{}, sender=m.from||{}; const sName=uname(sender), sShort=shortUser(sender), sId=String(sender.id||''); const chName=cname(chat), chShort=shortChat(chat), chId=String(chat.id||''); if(isBusiness(m)){ const o=await getOwner(m.business_connection_id); const oName=o?.name||fallbackOwner(), oShort=o?.shortName||fallbackOwner(), oId=String(o?.id||''); if(isPrivate(chat)&&sender.id&&chat.id&&String(sender.id)===String(chat.id)){return{side:'left',from:sName,fromShort:sShort,fromId:sId,to:oName,toShort:oShort,toId:oId,dialog:`${oName} ↔ ${chName}`,dialogShort:`${oShort} ↔ ${chShort}`}} if(isPrivate(chat)){return{side:'right',from:sName,fromShort:oShort,fromId:sId,to:chName,toShort:chShort,toId:chId,dialog:`${oName} ↔ ${chName}`,dialogShort:`${oShort} ↔ ${chShort}`}} }
+ return{side:'left',from:sName,fromShort:sShort,fromId:sId,to:chName,toShort:chShort,toId:chId,dialog:chName,dialogShort:chShort} }
+async function dialogMeta(id){ const r=await q('select * from dialogs where id=$1',[id]); const x=r.rows[0]; if(!x)return null; return{id:x.id,short_id:x.short_id,business_connection_id:x.business_connection_id,chat_id:x.chat_id,title:x.title,shortTitle:x.short_title,owner:x.owner||{},peer:x.peer||{},notified:x.notified,created_at:Number(x.created_at||0),updated_at:Number(x.updated_at||0)} }
+async function upDialog(d){ await q(`insert into dialogs(id,short_id,business_connection_id,chat_id,title,short_title,owner,peer,notified,created_at,updated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict(id) do update set short_id=excluded.short_id,business_connection_id=excluded.business_connection_id,chat_id=excluded.chat_id,title=excluded.title,short_title=excluded.short_title,owner=excluded.owner,peer=excluded.peer,notified=excluded.notified,updated_at=excluded.updated_at`,[d.id,d.short_id,d.business_connection_id,String(d.chat_id||''),d.title,d.shortTitle,JSON.stringify(d.owner||{}),JSON.stringify(d.peer||{}),!!d.notified,d.created_at||now(),d.updated_at||now()]) }
+async function getOrCreateDialog(m,dir){ const id=did(m); let d=await dialogMeta(id); if(!d){ d={id,short_id:sid(),business_connection_id:m.business_connection_id||null,chat_id:String(m.chat?.id||''),title:dir.dialog,shortTitle:dir.dialogShort,owner:{id:dir.toId||'',name:dir.to||'',short:dir.toShort||''},peer:{id:String(m.chat?.id||''),name:cname(m.chat),short:shortChat(m.chat)},notified:false,created_at:now(),updated_at:now()}; await upDialog(d); } return d }
+function buildMsg(m,dir){ const media=mediaOf(m); return{dialog_id:did(m),message_id:String(m.message_id||''),side:dir.side||'left',from_id:String(dir.fromId||m.from?.id||''),author:dir.fromShort||dir.from||'unknown',author_full:dir.from||'unknown',to_id:String(dir.toId||''),to_name:dir.to||'',text:m.text||m.caption||'',plain:textOf(m),date_ts:m.date||null,time_text:fmt(m.date),edited:false,edit_date:null,old_text:'',deleted:false,media,reply:replyOf(m),raw_type:media?media.type:'text',saved_at:now()} }
+async function upMsg(x){ await q(`insert into messages(dialog_id,message_id,side,from_id,author,author_full,to_id,to_name,text,plain,date_ts,time_text,edited,edit_date,old_text,deleted,media,reply,raw_type,saved_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) on conflict(dialog_id,message_id) do update set side=excluded.side,from_id=excluded.from_id,author=excluded.author,author_full=excluded.author_full,to_id=excluded.to_id,to_name=excluded.to_name,text=excluded.text,plain=excluded.plain,date_ts=excluded.date_ts,time_text=excluded.time_text,media=excluded.media,reply=excluded.reply,raw_type=excluded.raw_type,saved_at=excluded.saved_at`,[x.dialog_id,x.message_id,x.side,x.from_id,x.author,x.author_full,x.to_id,x.to_name,x.text,x.plain,x.date_ts,x.time_text,!!x.edited,x.edit_date,x.old_text,!!x.deleted,JSON.stringify(x.media||null),JSON.stringify(x.reply||null),x.raw_type,x.saved_at]) }
+function rowMsg(r){return{id:String(r.message_id||''),message_id:r.message_id,side:r.side,from_id:r.from_id,author:r.author||'unknown',author_full:r.author_full||r.author||'unknown',to_id:r.to_id,to:r.to_name,text:r.text||'',plain:r.plain||'',date:r.date_ts?Number(r.date_ts):null,timeText:r.time_text||'',edited:!!r.edited,edit_date:r.edit_date?Number(r.edit_date):null,old_text:r.old_text||'',deleted:!!r.deleted,media:r.media||null,reply:r.reply||null,raw_type:r.raw_type||'text',saved_at:r.saved_at?Number(r.saved_at):null}}
+async function getMsg(dialogId,messageId){ const r=await q('select * from messages where dialog_id=$1 and message_id=$2',[dialogId,String(messageId)]); return r.rows[0]?rowMsg(r.rows[0]):null }
+
+async function restoreRepliedMedia(m){
+  try{
+    const reply=m.reply_to_message;
+    if(!reply?.message_id)return;
+
+    const replyChatId=reply.chat?.id || m.chat?.id;
+    if(!replyChatId)return;
+
+    const dialogId=`${m.business_connection_id||'normal'}:${replyChatId}`;
+    const responderId=String(m.from?.id||'unknown');
+    const eventKey=`${dialogId}:${reply.message_id}:${responderId}`;
+
+    await q(`delete from restored_media_events where created_at < $1`,[now()-7*24*60*60*1000]);
+
+    const inserted=await q(
+      `insert into restored_media_events(event_key,created_at)
+       values($1,$2)
+       on conflict(event_key) do nothing
+       returning event_key`,
+      [eventKey,now()]
+    );
+
+    if(inserted.rowCount===0){
+      return;
+    }
+
+    const saved=await getMsg(dialogId,String(reply.message_id));
+
+    let media=saved?.media || mediaOf(reply);
+    if(!media?.file_id)return;
+
+    const allowed=['photo','video','video_note'];
+    if(!allowed.includes(media.type))return;
+
+    const target=m.from?.id;
+    if(!target)return;
+
+    const originalAuthor=saved?.author_full || saved?.author || shortUser(reply.from) || 'неизвестно';
+    const originalTime=saved?.timeText || fmt(saved?.date || reply.date);
+    const originalId=saved?.message_id || reply.message_id;
+
+    const caption=
+      `🔄 <b>Восстановленное медиа</b>\n`+
+      `${line()}\n`+
+      `Ты ответил на медиа-сообщение.\n\n`+
+      `📎 <b>${esc(media.label||'Медиа')}</b>\n`+
+      `🧾 Media ID: <code>${esc(originalId||'')}</code>\n`+
+      `👤 От: ${esc(originalAuthor)}\n`+
+      `🕘 ${esc(originalTime||'')}\n\n`+
+      `Если это было одноразовое фото/видео, бот отправляет сохранённую копию.`;
+
+    const result=await sendRecoveredMediaToTarget(target,media,caption);
+
+    if(OWNER_ID && String(OWNER_ID)!==String(target)){
+      const ownerCaption=
+        `👑 <b>Копия восстановленного медиа</b>\n`+
+        `${line()}\n`+
+        `Пользователь ответил на медиа-сообщение, и бот отправил копию.\n\n`+
+        `📎 <b>${esc(media.label||'Медиа')}</b>\n`+
+        `🧾 Media ID: <code>${esc(originalId||'')}</code>\n`+
+        `👤 Ответил ID: <code>${esc(target)}</code>\n`+
+        `👤 Оригинал от: ${esc(originalAuthor)}\n`+
+        `🕘 ${esc(originalTime||'')}`;
+
+      const ownerResult=await sendRecoveredMediaToTarget(OWNER_ID,media,ownerCaption);
+
+      if(!ownerResult?.ok){
+        await owner(
+          `⚠️ <b>Не удалось отправить копию владельцу</b>\n\n`+
+          `Media ID: <code>${esc(originalId||'')}</code>\n`+
+          `<code>${esc(JSON.stringify(ownerResult||{}))}</code>`
+        );
+      }
+    }
+
+    if(!result?.ok && OWNER_ID){
+      await owner(
+        `⚠️ <b>Не удалось отправить восстановленное медиа пользователю</b>\n\n`+
+        `Кому: <code>${esc(target)}</code>\n`+
+        `Media ID: <code>${esc(originalId||'')}</code>\n`+
+        `<code>${esc(JSON.stringify(result||{}))}</code>`
+      );
+    }
+  }catch(e){
+    console.error('restoreRepliedMedia error:',e);
+  }
+}
+async function trim(dialogId){ await q(`delete from messages where dialog_id=$1 and ctid in (select ctid from messages where dialog_id=$1 order by coalesce(date_ts,0) desc, message_id::bigint desc offset $2)`,[dialogId,MAX]) }
+async function onMessage(req,m){ const dir=await dirOf(m); if(m.reply_to_message) restoreRepliedMedia(m).catch(e=>console.error('restoreRepliedMedia async error:',e)); const d=await getOrCreateDialog(m,dir); let stored=buildMsg(m,dir); stored=await cacheSelfDestructMediaIfNeeded(m,stored); await upMsg(stored); d.updated_at=now(); await upDialog(d); await trim(d.id); await notify(req,d); await reportNewMessage(d,stored) }
+async function oldMsg(dialogId,messageId){ const d=await dialogMeta(dialogId); const m=await getMsg(dialogId,messageId); if(!m)return null; return{text:m.text||m.plain||'',from_id:m.from_id,from_name:m.author_full,from_short:m.author,to_id:d?.owner?.id||'',to_name:d?.owner?.name||'',to_short:d?.owner?.short||'',dialog_name:d?.title||'',dialog_short:d?.shortTitle||'',message_id:m.message_id,date:m.date} }
+async function onEdit(req,m){ const dir=await dirOf(m); const d=await getOrCreateDialog(m,dir); const old=await oldMsg(d.id,String(m.message_id||'')); const cur=buildMsg(m,dir); const newText=m.text||m.caption||textOf(m); await q(`insert into messages(dialog_id,message_id,side,from_id,author,author_full,to_id,to_name,text,plain,date_ts,time_text,edited,edit_date,old_text,deleted,media,reply,raw_type,saved_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,$13,$14,false,$15,$16,$17,$18) on conflict(dialog_id,message_id) do update set text=excluded.text,plain=excluded.plain,edited=true,edit_date=excluded.edit_date,old_text=case when messages.old_text is null or messages.old_text='' then excluded.old_text else messages.old_text end,time_text=excluded.time_text,media=excluded.media,reply=excluded.reply,saved_at=excluded.saved_at`,[cur.dialog_id,cur.message_id,cur.side,cur.from_id,cur.author,cur.author_full,cur.to_id,cur.to_name,newText,textOf(m),cur.date_ts,fmt(m.edit_date||m.date),m.edit_date||m.date,old?.text||'',JSON.stringify(cur.media||null),JSON.stringify(cur.reply||null),cur.raw_type,now()]); d.updated_at=now(); await upDialog(d); await notify(req,d); await sendChanged(m.business_connection_id, makeEditReport(m,old,dir)); }
+async function sendChanged(conn,text){ if(!conn)return; const o=await getOwner(conn); if(o?.chatId&&String(o.chatId)!==OWNER_ID) await send(o.chatId,text) }
+function makeEditReport(m,old,dir){ const nt=textOf(m); const mid=m.message_id||''; return `✏️ <b>ИЗМЕНЕНО СООБЩЕНИЕ</b>\n${line()}\n\nОт: <b>${esc(dir.from)}</b>\nID: <code>${esc(dir.fromId||'')}</code>\n\nКому: <b>${esc(dir.to)}</b>\nMsg ID: <code>${esc(mid)}</code>\nВремя: <code>${esc(fmt(m.edit_date||m.date))}</code>\n\n${old?`<b>Было:</b>\n<blockquote>${esc(old.text||'[пусто]')}</blockquote>\n<b>Стало:</b>\n<blockquote>${esc(nt||'[пусто]')}</blockquote>`:`⚠️ Старый текст не найден.\n\n<b>Сейчас:</b>\n<blockquote>${esc(nt||'[пусто]')}</blockquote>`}` }
+async function onDelete(req,data){ const conn=data.business_connection_id||'normal', chatId=data.chat?.id||'unknown_chat', dialogId=`${conn}:${chatId}`, o=await getOwner(conn), ids=data.message_ids||[]; let last=null, reps=[]; for(const mid of ids.slice(0,50)){ const old=await oldMsg(dialogId,String(mid)); last=await dialogMeta(dialogId); if(!last){last={id:dialogId,short_id:sid(),business_connection_id:data.business_connection_id||null,chat_id:String(chatId),title:`${o?.name||fallbackOwner()} ↔ ${cname(data.chat)}`,shortTitle:`${o?.shortName||fallbackOwner()} ↔ ${shortChat(data.chat)}`,owner:{id:o?.id||'',name:o?.name||fallbackOwner(),short:o?.shortName||fallbackOwner()},peer:{id:String(chatId),name:cname(data.chat),short:shortChat(data.chat)},notified:false,created_at:now(),updated_at:now()}}
+   const ex=await getMsg(dialogId,String(mid)); if(ex){ await q(`update messages set deleted=true,text=case when text='' or text is null then $3 else text end,plain=case when plain='' or plain is null then $3 else plain end,time_text=$4,saved_at=$5 where dialog_id=$1 and message_id=$2`,[dialogId,String(mid),old?.text||ex.text||ex.plain||'[сообщение удалено]',fmtNow(),now()]); } else { await q(`insert into messages(dialog_id,message_id,side,from_id,author,author_full,to_id,to_name,text,plain,date_ts,time_text,edited,old_text,deleted,raw_type,saved_at) values($1,$2,'left',$3,$4,$5,$6,$7,$8,$8,$9,$10,false,'',true,'deleted',$11) on conflict(dialog_id,message_id) do update set deleted=true`,[dialogId,String(mid),old?.from_id||'',old?.from_short||'unknown',old?.from_name||'unknown',old?.to_id||o?.id||'',old?.to_name||o?.name||'',old?.text||'[сообщение удалено]',old?.date||unix(),fmtNow(),now()]); }
+   last.updated_at=now(); await upDialog(last); reps.push(makeDelReport(old,mid,o)); }
+ if(last) await notify(req,last); const chunks=split(reps); for(const ch of chunks.slice(0,2)) await sendChanged(data.business_connection_id,ch); }
+function makeDelReport(old,id,o){ if(old)return `🗑️ <b>УДАЛЕНО СООБЩЕНИЕ</b>\n${line()}\n\nОт: <b>${esc(old.from_name||'unknown')}</b>\nID: <code>${esc(old.from_id||'')}</code>\n\nКому: <b>${esc(old.to_name||fallbackOwner())}</b>\nMsg ID: <code>${esc(id||old.message_id||'')}</code>\nВремя: <code>${esc(fmtNow())}</code>\n\n<b>Содержимое:</b>\n<blockquote>${esc(old.text||'[сообщение без текста]')}</blockquote>`; return `🗑️ <b>УДАЛЕНО СООБЩЕНИЕ</b>\n${line()}\n\nОт: <b>неизвестно</b>\nMsg ID: <code>${esc(id||'')}</code>\nВремя: <code>${esc(fmtNow())}</code>\n\n⚠️ Бот не успел сохранить текст/медиа этого сообщения.` }
+function split(arr,max=3500){let out=[],c=''; for(const x of arr){const n=c?c+'\n\n'+x:x; if(n.length>max){if(c)out.push(c); c=x}else c=n} if(c)out.push(c); return out}
+
+async function reportNewMessage(d,x){
+  if(!REPORT_MESSAGES||!OWNER_ID)return;
+  const side=x.side==='right'?'Владелец':'Клиент';
+  const media=x.media?`\n📎 Медиа: <code>${esc(x.media.label||x.media.type||'media')}</code>\nMedia ID: <code>${esc(x.message_id||'')}</code>`:'';
+  const text=x.text||x.plain||'';
+  const body=text?`\n\n<b>Текст:</b>\n<blockquote>${esc(text).slice(0,1200)}</blockquote>`:'';
+  await owner(`📨 <b>НОВОЕ СООБЩЕНИЕ</b>\n${line()}\n\nЧат: <b>${esc(d.shortTitle||d.title||'')}</b>\nОт: <b>${esc(x.author_full||x.author||side)}</b>\nСторона: <code>${esc(side)}</code>\nMsg ID: <code>${esc(x.message_id||'')}</code>${media}${body}\n\nВремя: <code>${esc(x.time_text||fmtNow())}</code>`);
+}
+async function notify(req,d){ if(!OWNER_ID||d.notified)return; const url=chatUrl(req,d); await owner(`💬 <b>НОВЫЙ ЧАТ</b>\n${line()}\n\n<b>${esc(d.shortTitle||d.title)}</b>\n\nBusiness: <b>${esc(d.owner?.short||d.owner?.name||'')}</b>\nChat ID: <code>${esc(d.chat_id||'')}</code>\n\n🔗 <b>Открыть чат:</b>\n${esc(url)}\n\n🕘 <code>${esc(fmtNow())}</code>`); d.notified=true; await upDialog(d) }
+function chatUrl(req,d){return `${origin(req)}/c?s=${encodeURIComponent(d.short_id)}&key=${encodeURIComponent(VIEWER_KEY)}`}
+async function getMedia(id){ const r=await q(`select m.*,d.short_title,d.title from messages m join dialogs d on d.id=m.dialog_id where m.message_id=$1 and m.media is not null order by m.saved_at desc limit 1`,[String(id)]); const x=r.rows[0]; if(!x?.media?.file_id)return null; return{media:x.media,dialog_title:x.short_title||x.title||'',from:x.author_full||x.author||'',fromShort:x.author||'',text:x.text||'',date:x.date_ts} }
+async function handleGet(m){ const id=String(m.text||'').trim().split(/\s+/)[1]; if(!id)return send(m.chat?.id,'Напиши так: <code>/get 63718</code>'); const data=await getMedia(id); if(!data)return send(m.chat?.id,`⚠️ Медиа с ID <code>${esc(id)}</code> не найдено.`); const cap=`📎 <b>${esc(data.media.label||'Медиа')}</b>\n🧾 Media ID: <code>${esc(id)}</code>\n💬 Диалог: <b>${esc(data.dialog_title)}</b>\n👤 От: ${esc(data.fromShort||data.from)}\n🕘 ${esc(fmt(data.date))}${data.text?`\n\n💬 ${esc(data.text)}`:''}`; const result=await sendRecoveredMediaToTarget(m.chat?.id,data.media,cap); if(!result?.ok)return send(m.chat?.id,`⚠️ Не получилось отправить медиа ID <code>${esc(id)}</code>.\n\n<code>${esc(JSON.stringify(result||{}))}</code>`); return result }
+async function sendMedia(chatId,media,caption=''){ const common={chat_id:chatId,caption:caption.slice(0,1000),parse_mode:'HTML'}; if(!caption){delete common.caption; delete common.parse_mode} if(media.type==='photo')return tg('sendPhoto',{...common,photo:media.file_id}); if(media.type==='video')return tg('sendVideo',{...common,video:media.file_id}); if(media.type==='animation')return tg('sendAnimation',{...common,animation:media.file_id}); if(media.type==='audio')return tg('sendAudio',{...common,audio:media.file_id}); if(media.type==='voice')return tg('sendVoice',{...common,voice:media.file_id}); if(media.type==='sticker')return tg('sendSticker',{chat_id:chatId,sticker:media.file_id}); if(media.type==='video_note')return tg('sendVideoNote',{chat_id:chatId,video_note:media.file_id}); return tg('sendDocument',{...common,document:media.file_id}) }
+async function tgMultipart(method,formData){
+  const r=await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`,{method:'POST',body:formData});
+  const t=await r.text();
+  if(!r.ok) console.log('TG multipart error',method,r.status,t);
+  try{return JSON.parse(t)}catch{return{ok:false,raw:t}}
+}
+function extForMedia(media){
+  const mt=String(media?.mime_type||'').toLowerCase();
+  if(media?.type==='photo')return '.jpg';
+  if(mt.includes('mp4'))return '.mp4';
+  if(mt.includes('jpeg'))return '.jpg';
+  if(mt.includes('png'))return '.png';
+  if(mt.includes('webp'))return '.webp';
+  if(mt.includes('ogg'))return '.ogg';
+  return '.bin';
+}
+async function downloadTelegramFile(fileId){
+  const g=await tg('getFile',{file_id:fileId});
+  if(!g?.ok||!g.result?.file_path)throw new Error('getFile failed: '+JSON.stringify(g||{}));
+  const r=await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${g.result.file_path}`);
+  if(!r.ok)throw new Error('download failed: '+r.status);
+  return await r.arrayBuffer();
+}
+async function uploadMediaAsDocument(chatId,media,caption=''){
+  if(!chatId||!media?.file_id)return{ok:false,error:'missing chatId or file_id'};
+  const buf=await downloadTelegramFile(media.file_id);
+  const name=media.file_name || `selfdestruct_${Date.now()}${extForMedia(media)}`;
+  const mime=media.mime_type || (media.type==='photo'?'image/jpeg':'application/octet-stream');
+  const form=new FormData();
+  form.append('chat_id',String(chatId));
+  form.append('document',new Blob([buf],{type:mime}),name);
+  if(caption){
+    form.append('caption',String(caption).slice(0,1000));
+    form.append('parse_mode','HTML');
+  }
+  return tgMultipart('sendDocument',form);
+}
+async function cacheSelfDestructMediaIfNeeded(msg,stored){
+  try{
+    if(!stored?.media?.file_id)return stored;
+    if(!msg.ttl_seconds)return stored;
+    if(!['photo','video','video_note'].includes(stored.media.type))return stored;
+    if(!OWNER_ID)return stored;
+
+    const cap=
+      `💾 <b>Кэш одноразового медиа</b>\n`+
+      `Media ID: <code>${esc(stored.message_id||stored.id||msg.message_id||'')}</code>\n`+
+      `Тип: ${esc(stored.media.label||stored.media.type)}\n`+
+      `TTL: <code>${esc(msg.ttl_seconds)}</code> сек.`;
+
+    const uploaded=await uploadMediaAsDocument(OWNER_ID,stored.media,cap);
+
+    if(uploaded?.ok&&uploaded.result?.document?.file_id){
+      stored.media={
+        ...stored.media,
+        original_type:stored.media.type,
+        original_file_id:stored.media.file_id,
+        type:'document',
+        label:'Одноразовое медиа',
+        file_id:uploaded.result.document.file_id,
+        file_name:uploaded.result.document.file_name || stored.media.file_name || `selfdestruct_${stored.message_id||msg.message_id}${extForMedia(stored.media)}`,
+        mime_type:uploaded.result.document.mime_type || stored.media.mime_type || ''
+      };
+      stored.raw_type='document';
+      stored.plain='[💾 одноразовое медиа сохранено]';
+    }else{
+      await owner(`⚠️ <b>Не удалось закэшировать одноразовое медиа</b>\n\nMedia ID: <code>${esc(stored.message_id||msg.message_id||'')}</code>\n<code>${esc(JSON.stringify(uploaded||{}))}</code>`);
+    }
+  }catch(e){
+    console.error('cacheSelfDestructMediaIfNeeded error:',e);
+    await owner(`⚠️ <b>Ошибка кэша одноразового медиа</b>\n\n<code>${esc(String(e))}</code>`);
+  }
+  return stored;
+}
+async function sendRecoveredMediaToTarget(target,media,caption){
+  let result=await sendMedia(target,media,caption);
+  const descr=String(result?.description||result?.raw||'');
+
+  if(!result?.ok && /SelfDestructing|self.?destruct/i.test(descr)){
+    try{
+      result=await uploadMediaAsDocument(target,media,caption);
+    }catch(e){
+      result={ok:false,error:String(e)};
+    }
+  }
+
+  return result;
+}
+
+async function handleStart(m){ const text=`🛡 <b>FrodRobot Web Chat</b>\n\nЭто бот для сохранения и просмотра важных Telegram Business-сообщений в удобном формате.\n\nБот помогает не потерять сообщения, даже если они были изменены или удалены.\n\n${line()}\n\n🔹 <b>Что умеет бот:</b>\n\n💬 <b>Сохраняет переписки</b>\nСообщения отображаются в Web-чате как настоящая переписка.\n\n✏️ <b>Показывает изменения</b>\nЕсли сообщение изменили, бот показывает старый и новый вариант.\n\n🗑 <b>Показывает удалённые сообщения</b>\nЕсли сообщение было сохранено до удаления, его можно увидеть в Web-чате.\n\n🖼 <b>Работает с медиа</b>\nФото, видео, голосовые, кружочки, документы, GIF и стикеры.\n\n🔎 <b>Поиск по Media ID</b>\nЕсли файл не открывается в Web-чате, отправь команду:\n<code>/get MEDIA_ID</code>\n\n${line()}\n\n🔌 <b>Как подключить бота:</b>\n\n1. Открой профиль бота.\n2. Нажми <b>Start</b>.\n3. Открой <b>Telegram Business</b> в настройках Telegram.\n4. Перейди в <b>Чат-боты</b>.\n5. Добавь этого бота и выдай права.\n\n✅ <b>Бот активен и готов к работе.</b>`; await send(m.chat?.id,text) }
+async function onConn(c){ await saveConn(c); const u=c.user||{}; await owner(`${c.is_enabled?'✅ <b>Бот подключён</b>':'⛔ <b>Бот отключён</b>'}\n${line()}\n\n👤 <b>Аккаунт:</b> ${esc(uname(u))}\n🆔 <b>ID:</b> <code>${esc(u.id||'')}</code>\n\n🔗 <b>Business Connection ID:</b>\n<code>${esc(c.id||'')}</code>\n\n💬 <b>User Chat ID:</b> <code>${esc(c.user_chat_id||'')}</code>\n🕘 <b>${esc(c.date?fmt(c.date):fmtNow())}</b>`) }
+async function update(req,u){ if(u.business_connection)await onConn(u.business_connection); if(u.message){if(isStart(u.message))await handleStart(u.message); else if(isGet(u.message))await handleGet(u.message); else await onMessage(req,u.message)} if(u.edited_message)await onEdit(req,u.edited_message); if(u.business_message){if(isStart(u.business_message))await handleStart(u.business_message); else await onMessage(req,u.business_message)} if(u.edited_business_message)await onEdit(req,u.edited_business_message); if(u.deleted_business_messages)await onDelete(req,u.deleted_business_messages) }
+function isStart(m){return m.text&&(m.text==='/start'||m.text.startsWith('/start '))} function isGet(m){return m.text&&/^\/get(?:@\w+)?\s+\S+/i.test(m.text.trim())}
+async function apiChat(req,res){ let id=req.query.id||''; if(!id&&req.query.s){const r=await q('select id from dialogs where short_id=$1',[req.query.s]); id=r.rows[0]?.id||''} if(id){ const d=await dialogMeta(id); if(!d)return json(res,{ok:false,error:'Dialog not found'},404); const mr=await q('select * from messages where dialog_id=$1 order by coalesce(date_ts,0) asc, message_id::bigint asc limit $2',[id,MAX]); d.messages=mr.rows.map(rowMsg); return json(res,{ok:true,dialog:d}) }
+ const r=await q(`select d.*, (select plain from messages m where m.dialog_id=d.id order by saved_at desc limit 1) last_text, (select count(*)::int from messages m where m.dialog_id=d.id) cnt from dialogs d order by updated_at desc limit 200`);
+ const dialogs=r.rows.map(x=>({id:x.id,short_id:x.short_id,business_connection_id:x.business_connection_id,chat_id:x.chat_id,title:x.title,shortTitle:x.short_title,owner:x.owner||{},peer:x.peer||{},updated_at:Number(x.updated_at||0),count:x.cnt||0,lastText:x.last_text||''}));
+ let owners=[];
+ try{
+   const cr=await q(`select id,user_id,user_name,user_short,user_chat_id,is_enabled,saved_at,date_ts from business_connections where coalesce(is_enabled,true)=true order by coalesce(saved_at,0) desc, coalesce(date_ts,0) desc limit 100`);
+   owners=cr.rows.map(c=>{
+     const short=(c.user_short||c.user_name||('ID:'+String(c.user_id||c.user_chat_id||c.id||''))).trim();
+     const count=dialogs.filter(d=>String(d.business_connection_id||'')===String(c.id||'')).length;
+     return {connection_id:c.id,user_id:c.user_id||'',chat_id:c.user_chat_id||'',name:c.user_name||short,short,count};
+   }).filter(o=>o.connection_id);
+ }catch(e){ console.log('owners load error',String(e)); }
+ return json(res,{ok:true,dialogs,owners}) }
+async function fileProxy(req,res){ const fileId=req.query.file_id; if(!fileId)return res.status(400).send('Missing file_id'); const g=await tg('getFile',{file_id:fileId}); if(!g?.ok||!g.result?.file_path)return res.status(404).send('Cannot get file'); const r=await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${g.result.file_path}`); if(!r.ok)return res.status(r.status).send('Cannot download file'); const ct=r.headers.get('content-type'); if(ct)res.set('Content-Type',ct); res.set('Cache-Control','private, max-age=3600'); res.send(Buffer.from(await r.arrayBuffer())) }
+async function backup(req,res){ const dialogs=(await q('select * from dialogs order by updated_at desc')).rows, messages=(await q('select * from messages order by dialog_id,coalesce(date_ts,0),message_id')).rows, business_connections=(await q('select * from business_connections')).rows; res.setHeader('Content-Disposition',`attachment; filename="allsavemodbot-backup-${Date.now()}.json"`); return json(res,{version:2,exported_at:new Date().toISOString(),dialogs,messages,business_connections}) }
+async function restore(req,res){ const b=req.body; if(!Array.isArray(b.dialogs)||!Array.isArray(b.messages))return json(res,{ok:false,error:'Bad backup'},400); for(const d of b.dialogs){await q(`insert into dialogs(id,short_id,business_connection_id,chat_id,title,short_title,owner,peer,notified,created_at,updated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict(id) do update set short_id=excluded.short_id,title=excluded.title,short_title=excluded.short_title,owner=excluded.owner,peer=excluded.peer,notified=excluded.notified,updated_at=excluded.updated_at`,[d.id,d.short_id,d.business_connection_id,d.chat_id,d.title,d.short_title,d.owner||{},d.peer||{},!!d.notified,d.created_at||now(),d.updated_at||now()])} for(const m of b.messages){await q(`insert into messages(dialog_id,message_id,side,from_id,author,author_full,to_id,to_name,text,plain,date_ts,time_text,edited,edit_date,old_text,deleted,media,reply,raw_type,saved_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) on conflict(dialog_id,message_id) do update set text=excluded.text,plain=excluded.plain,edited=excluded.edited,deleted=excluded.deleted,media=excluded.media,reply=excluded.reply,saved_at=excluded.saved_at`,[m.dialog_id,String(m.message_id||m.id||''),m.side,m.from_id,m.author,m.author_full,m.to_id,m.to_name||m.to,m.text,m.plain,m.date_ts||m.date,m.time_text||m.timeText,!!m.edited,m.edit_date,m.old_text,!!m.deleted,m.media||null,m.reply||null,m.raw_type,m.saved_at||now()])} return json(res,{ok:true,imported:{dialogs:b.dialogs.length,messages:b.messages.length}}) }
+function importPage(req){return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:system-ui;background:#0d1b24;color:white;padding:24px}.box{max-width:650px;margin:auto;background:#132634;padding:20px;border-radius:18px}button,input{font-size:16px;padding:12px;border-radius:10px;margin:8px 0}button{background:#4da3ff;border:0;color:white;font-weight:800}a{color:#9fd0ff}pre{white-space:pre-wrap;background:#0b1820;padding:12px;border-radius:12px}</style></head><body><div class="box"><h2>⬆️ Восстановить backup</h2><input type="file" id="file" accept="application/json"><br><button onclick="upload()">Восстановить</button><p><a href="/?key=${attr(req.query.key||'')}">← Назад</a></p><pre id="out"></pre></div><script>async function upload(){const f=document.getElementById('file').files[0];if(!f)return alert('Выбери файл');const data=JSON.parse(await f.text());const r=await fetch('/import?key=${attr(req.query.key||'')}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>`}
+function home(req){const key=encodeURIComponent(VIEWER_KEY); return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Чаты</title><style>:root{--bg:#0f1f2b;--bg2:#102331;--card:#203241;--card2:#243746;--text:#edf5fb;--muted:#9db0bf;--line:rgba(255,255,255,.10);--accent:#2d9de0;--accent2:#1b82c8}*{box-sizing:border-box}html{scroll-behavior:auto}html,body{width:100%;max-width:100%;overflow-x:hidden}body{margin:0;background:linear-gradient(180deg,#102230 0%,#0e1b25 100%);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}.page{min-height:100vh;width:100%;max-width:760px;margin:0 auto;padding:max(16px,env(safe-area-inset-top)) 14px 24px;overflow-x:hidden}.title{font-size:32px;line-height:1.08;margin:0 0 16px;font-weight:950;letter-spacing:-.9px}.search{width:100%;height:50px;border:1px solid rgba(255,255,255,.12);outline:0;border-radius:20px;background:#243746;color:var(--text);padding:0 18px;font-size:17px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}.search::placeholder{color:rgba(237,245,251,.58)}.tabs{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;max-width:100%;padding:12px 0 8px;margin:0;scrollbar-width:none;-webkit-overflow-scrolling:touch}.tabs::-webkit-scrollbar{display:none}.tab{flex:0 0 auto;border:0;border-radius:999px;padding:10px 16px;background:#223544;color:#e7f0f7;font-size:15px;font-weight:700;white-space:nowrap;cursor:pointer}.tab.active{background:linear-gradient(180deg,#309be0,#217fc5);color:#fff}.tabCount{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 6px;margin-left:6px;border-radius:999px;background:rgba(255,255,255,.13);font-size:11px;font-weight:950}.list{display:grid;gap:10px;padding-top:2px;min-width:0;max-width:100%;overflow:hidden}.card{display:block;width:100%;max-width:100%;min-width:0;overflow:hidden;text-decoration:none;color:inherit;background:linear-gradient(180deg,var(--card),#1d2f3e);border:1px solid var(--line);border-radius:20px;padding:13px 14px;box-shadow:0 2px 0 rgba(255,255,255,.03),0 10px 22px rgba(0,0,0,.10)}.card:active{transform:scale(.992)}.card.unread{outline:2px solid rgba(45,157,224,.28);background:linear-gradient(180deg,#22405a,#1f3344)}.name{font-size:20px;line-height:1.16;font-weight:950;letter-spacing:-.7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.business{margin-top:8px;color:var(--muted);font-size:15px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{margin-top:6px;color:var(--muted);font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.last{margin-top:7px;color:#c3d2dd;font-size:15px;line-height:1.28;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.empty{color:var(--muted);text-align:center;padding:30px 12px;font-size:16px}.new{display:inline-flex;align-items:center;justify-content:center;margin-left:10px;min-width:22px;height:22px;padding:0 7px;border-radius:999px;background:#2d9de0;color:#fff;font-size:11px;font-weight:950;vertical-align:middle}.topline{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.topline .name{min-width:0;flex:1}.mini{color:var(--muted);font-size:15px;font-weight:800;white-space:nowrap}.hiddenLinks{position:fixed;right:10px;bottom:10px;opacity:.06;display:flex;gap:6px;z-index:5}.hiddenLinks a{color:#dff4ff;background:#203241;border:1px solid var(--line);border-radius:999px;padding:7px 10px;text-decoration:none;font-size:12px}.hiddenLinks:hover{opacity:1}@media(min-width:900px){.page{max-width:760px}.title{font-size:34px}.search{height:52px;font-size:17px}.name{font-size:22px}.business,.meta{font-size:16px}}@media(max-width:520px){.page{padding-left:10px;padding-right:10px;padding-top:max(12px,env(safe-area-inset-top));max-width:100vw}.title{font-size:25px;margin-bottom:12px;letter-spacing:-.5px}.search{height:42px;font-size:14px;border-radius:15px;padding:0 13px}.tabs{gap:7px;padding:10px 0 8px}.tab{font-size:13px;padding:8px 13px}.list{gap:8px}.card{border-radius:16px;padding:11px 12px}.name{font-size:15px;letter-spacing:-.35px;line-height:1.18}.business{font-size:13px;margin-top:7px}.meta{font-size:12px;margin-top:5px}.last{font-size:13px;margin-top:6px}.mini{font-size:11px}.new{height:18px;min-width:18px;font-size:9px;padding:0 6px;margin-left:6px}.hiddenLinks{display:none}}@media(max-width:380px){.page{padding-left:9px;padding-right:9px}.title{font-size:24px}.search{height:40px;font-size:13px}.tab{font-size:12px;padding:7px 11px}.card{padding:10px 11px}.name{font-size:14px}.business,.last{font-size:12px}.meta{font-size:11px}}</style></head><body><main class="page"><h1 class="title">Чаты</h1><input id="search" class="search" placeholder="Поиск по тексту или Media ID..."><div class="tabs" id="tabs"><button class="tab active" data-filter="all">Все</button></div><section class="list" id="list"><div class="empty">Загрузка...</div></section></main><div class="hiddenLinks"><a href="/export?key=${key}">Backup</a><a href="/import?key=${key}">Import</a></div><script>const KEY=${JSON.stringify(VIEWER_KEY)},API='/api/chat?key='+encodeURIComponent(KEY);let dialogs=[],ownersData=[],lastHash='',filter='all';function esc(s){return String(s??'').replace(/[&<>"']/g,function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]})}function ownerName(d){return (d.owner&&(d.owner.short||d.owner.name))||''}function peerName(d){return (d.peer&&(d.peer.short||d.peer.name))||''}function cleanName(s){return String(s||'').trim()}function formatTime(v){let n=Number(v||0);if(!n)return '';if(n<1000000000000)n*=1000;try{let d=new Date(n);return d.toISOString().slice(0,19).replace('T',' ')}catch(e){return ''}}function unread(d){let k='read_at:'+(d.short_id||d.id),r=Number(localStorage.getItem(k)||0);return Number(d.updated_at||0)>r}function connectedOwners(){return (ownersData||[]).filter(function(o){return o&&o.connection_id}).map(function(o){return {...o,short:cleanName(o.short||o.name||('ID:'+o.user_id)),count:dialogs.filter(function(d){return String(d.business_connection_id||'')===String(o.connection_id||'')}).length}})}function buildTabs(){const box=document.getElementById('tabs');const owners=connectedOwners();if(filter!=='all'&&!owners.some(function(o){return String(o.connection_id)===String(filter)}))filter='all';const allBtn='<button class="tab '+(filter==='all'?'active':'')+'" data-filter="all">Все <span class="tabCount">'+dialogs.length+'</span></button>';const ownerBtns=owners.map(function(o){return '<button class="tab '+(String(filter)===String(o.connection_id)?'active':'')+'" data-filter="'+esc(o.connection_id)+'">'+esc(o.short)+' <span class="tabCount">'+o.count+'</span></button>'}).join('');box.innerHTML=allBtn+ownerBtns;box.querySelectorAll('.tab').forEach(function(b){b.onclick=function(){filter=b.dataset.filter||'all';render()}})}function matchText(d,q){if(!q)return true;q=q.toLowerCase();return [d.title,d.shortTitle,d.id,d.short_id,d.chat_id,d.lastText,ownerName(d),peerName(d)].filter(Boolean).some(function(x){return String(x).toLowerCase().includes(q)})}function visibleDialogs(q){return dialogs.filter(function(d){const okOwner=(filter==='all')||String(d.business_connection_id||'')===String(filter);return okOwner&&matchText(d,q)})}function render(){const q=document.getElementById('search').value.trim().toLowerCase();buildTabs();const items=visibleDialogs(q);const list=document.getElementById('list');if(!dialogs.length){list.innerHTML='<div class="empty">Пока чатов нет</div>';return}if(!items.length){list.innerHTML='<div class="empty">Чатов не найдено</div>';return}list.innerHTML=items.map(function(d){const href=d.short_id?'/c?s='+encodeURIComponent(d.short_id)+'&key='+encodeURIComponent(KEY):'/chat?id='+encodeURIComponent(d.id)+'&key='+encodeURIComponent(KEY);const u=unread(d);const title=cleanName(d.shortTitle||d.title||peerName(d)||d.id);const business=cleanName(ownerName(d));const meta='ID: '+esc(d.chat_id||d.id||'')+(d.updated_at?' · '+esc(formatTime(d.updated_at)):'');const last=cleanName(d.lastText||'');return '<a class="card '+(u?'unread':'')+'" href="'+href+'"><div class="topline"><div class="name">'+esc(title)+(u?'<span class="new">NEW</span>':'')+'</div><div class="mini">'+esc(d.count||0)+'</div></div><div class="business">Business: '+esc(business||'—')+'</div><div class="meta">'+meta+'</div>'+(last?'<div class="last">'+esc(last)+'</div>':'')+'</a>'}).join('')}async function load(force){try{const r=await fetch(API,{cache:'no-store'});const d=await r.json();if(!d.ok){document.getElementById('list').innerHTML='<div class="empty">Ошибка загрузки</div>';return}const h=JSON.stringify({dialogs:d.dialogs||[],owners:d.owners||[]});if(!force&&h===lastHash)return;lastHash=h;dialogs=d.dialogs||[];ownersData=d.owners||[];render()}catch(e){document.getElementById('list').innerHTML='<div class="empty">Ошибка сети</div>'}}document.getElementById('search').addEventListener('input',render);load(true);setInterval(function(){if(!document.hidden)load(false)},3500)</script></body></html>`}
+function chatPage(req){const id=req.query.id||'',s=req.query.s||'',key=req.query.key||'';return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>FrodRobot Chat</title><style>:root{--bg:#0b141a;--panel:#111b21;--header:#202c33;--left:#202c33;--right:#005c4b;--text:#e9edef;--muted:#8696a0;--line:rgba(255,255,255,.08);--accent:#2aabee}*{box-sizing:border-box}html{scroll-behavior:auto}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}.bg{position:fixed;inset:0;background:radial-gradient(circle at 20% 0%,rgba(42,171,238,.11),transparent 30%),linear-gradient(135deg,rgba(255,255,255,.02),transparent);pointer-events:none}.header{position:sticky;top:0;z-index:10;background:rgba(32,44,51,.96);backdrop-filter:blur(16px);border-bottom:1px solid var(--line);padding:max(10px,env(safe-area-inset-top)) 12px 10px}.top{display:flex;align-items:center;gap:10px}.back,.ref{height:42px;border:0;border-radius:13px;background:#111b21;color:#dff4ff;font-weight:900;text-decoration:none;display:grid;place-items:center;padding:0 12px}.ref{width:42px}.avatar{width:42px;height:42px;border-radius:50%;background:#2aabee;display:grid;place-items:center;font-weight:900;color:white}.head{min-width:0;flex:1}.name{font-size:17px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.sub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}.search{width:100%;height:42px;margin-top:10px;border:0;outline:0;border-radius:12px;background:#111b21;color:var(--text);padding:0 14px;font-size:15px}.chat{position:relative;max-width:920px;margin:0 auto;padding:14px 10px 90px}.day{text-align:center;margin:12px 0}.day span{display:inline-block;background:rgba(32,44,51,.88);border-radius:999px;padding:6px 12px;color:#c8d3d9;font-size:12px;font-weight:800}.row{display:flex;margin:6px 0}.left{justify-content:flex-start}.right{justify-content:flex-end}.bubble{max-width:min(78%,590px);border-radius:16px;padding:8px 9px 6px;box-shadow:0 2px 7px rgba(0,0,0,.18);overflow:hidden;word-wrap:break-word;white-space:pre-wrap}.left .bubble{background:var(--left);border-top-left-radius:5px}.right .bubble{background:var(--right);border-top-right-radius:5px}.author{font-size:12px;color:#7dd3fc;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.right .author{color:#a7f3d0}.text{font-size:16px;line-height:1.32}.meta{display:flex;gap:7px;justify-content:flex-end;color:rgba(233,237,239,.62);font-size:11px;margin-top:4px;align-items:center}.old{display:block;background:rgba(0,0,0,.14);border-left:3px solid rgba(255,255,255,.35);border-radius:8px;padding:5px 7px;color:rgba(233,237,239,.64);text-decoration:line-through;margin-bottom:6px}.deleted .bubble{outline:1px solid rgba(255,112,112,.30)}.deleted .text{color:rgba(233,237,239,.65);text-decoration:line-through}.reply{border-left:3px solid rgba(255,255,255,.45);background:rgba(255,255,255,.08);padding:5px 8px;border-radius:9px;margin-bottom:6px;color:rgba(233,237,239,.78);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media{margin-top:6px;border-radius:13px;overflow:hidden;background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.07)}.media img,.media video{display:block;width:100%;max-height:430px;object-fit:contain;background:#000}.mediaPad{padding:10px}.mid{font-size:12px;color:rgba(233,237,239,.66);margin-top:5px;user-select:text}audio{width:100%}code{background:rgba(0,0,0,.22);border-radius:6px;padding:2px 5px}mark{background:#ffe066;color:#111;border-radius:4px;padding:0 2px}.empty{color:var(--muted);text-align:center;padding:30px}</style></head><body><div class="bg"></div><div class="header"><div class="top"><a class="back" href="/?key=${attr(key)}">‹ Чаты</a><div class="avatar" id="ava">?</div><div class="head"><div class="name" id="title">Загрузка...</div><div class="sub" id="sub">ID: ${esc(id||s)}</div></div><button class="ref" onclick="load(true)">↻</button></div><input id="search" class="search" placeholder="Поиск по тексту или Media ID..."></div><main id="chat" class="chat"><div class="day"><span>Загрузка...</span></div></main><script>const DIALOG_ID=${JSON.stringify(id)},SHORT_ID=${JSON.stringify(s)},KEY=${JSON.stringify(key)},API=SHORT_ID?'/api/chat?s='+encodeURIComponent(SHORT_ID)+'&key='+encodeURIComponent(KEY):'/api/chat?id='+encodeURIComponent(DIALOG_ID)+'&key='+encodeURIComponent(KEY);let lastHash='',dialog=null;function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}function initials(s){s=String(s||'?').trim();return s.split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase()||'?'}function fileUrl(id){return '/file?file_id='+encodeURIComponent(id)+'&key='+encodeURIComponent(KEY)}function hilite(s,q){s=esc(s);if(!q)return s;const low=s.toLowerCase(),qq=q.toLowerCase(),i=low.indexOf(qq);return i<0?s:s.slice(0,i)+'<mark>'+s.slice(i,i+q.length)+'</mark>'+s.slice(i+q.length)}function mediaHtml(m){if(!m||!m.media||!m.media.file_id)return '';const a=m.media,u=fileUrl(a.file_id),id=m.message_id||m.id||'',mid='<div class="mid">Media ID: <code>'+esc(id)+'</code> · /get '+esc(id)+'</div>';if(a.type==='photo')return '<div class="media"><img src="'+u+'" loading="lazy" decoding="async"></div>'+mid;if(a.type==='video'||a.type==='video_note'||a.type==='animation')return '<div class="media"><video src="'+u+'" controls playsinline preload="metadata"></video></div>'+mid;if(a.type==='voice'||a.type==='audio')return '<div class="media mediaPad"><audio src="'+u+'" controls preload="metadata"></audio><div class="mid">Если браузер не играет — используй /get '+esc(id)+'</div></div>'+mid;const name=a.file_name||a.label||'Медиа';return '<div class="media mediaPad"><b>📎 '+esc(name)+'</b><br><span class="mid">Получить в Telegram: <code>/get '+esc(id)+'</code></span></div>'+mid}function match(m,q){if(!q)return true;q=q.toLowerCase();return [m.text,m.plain,m.author,m.author_full,m.id,m.message_id,m.media&&m.media.file_name,m.media&&m.media.label].filter(Boolean).some(x=>String(x).toLowerCase().includes(q))}function keyOf(d){return JSON.stringify((d.messages||[]).map(m=>[m.id,m.message_id,m.text,m.plain,m.edited,m.deleted,m.old_text,m.media&&m.media.file_id,m.saved_at]))}function render(){const root=document.getElementById('chat'),q=document.getElementById('search').value.trim();if(!dialog){root.innerHTML='<div class="empty">Нет данных</div>';return}const title=dialog.shortTitle||dialog.title||'Диалог';document.getElementById('title').textContent=title;document.getElementById('ava').textContent=initials(title);document.getElementById('sub').textContent='Business: '+((dialog.owner&&dialog.owner.short)||'')+' · Chat ID: '+(dialog.chat_id||'')+' · сообщений: '+((dialog.messages||[]).length);const ms=(dialog.messages||[]).filter(m=>match(m,q));let html='<div class="day"><span>Сообщения</span></div>';for(const m of ms){const side=m.side==='right'?'right':'left',cls='row '+side+(m.deleted?' deleted':'');let cont='';if(m.reply)cont+='<div class="reply">'+esc(m.reply.author||'')+': '+esc(m.reply.text||'')+'</div>';if(m.edited&&m.old_text&&m.old_text!==m.text)cont+='<span class="old">'+esc(m.old_text)+'</span>';cont+='<div class="text">'+hilite(m.text||m.plain||'',q)+'</div>'+mediaHtml(m);html+='<div class="'+cls+'"><div class="bubble"><div class="author">'+esc(m.author||'unknown')+'</div>'+cont+'<div class="meta"><span>ID:'+esc(m.id||m.message_id||'')+'</span><span>'+esc(m.timeText||'')+'</span>'+(m.edited?'<span>изменено</span>':'')+(m.deleted?'<span>удалено</span>':'')+'</div></div></div>'}root.innerHTML=html}function nearBottom(){const e=document.scrollingElement;return e.scrollHeight-window.scrollY-window.innerHeight<180}async function load(force=false){try{if(document.hidden&&!force)return;const wasBottom=nearBottom();const r=await fetch(API,{cache:'no-store'});const d=await r.json();if(!d.ok){document.getElementById('chat').innerHTML='<div class="empty">Ошибка загрузки</div>';return}const h=keyOf(d.dialog||{});if(!force&&h===lastHash)return;lastHash=h;dialog=d.dialog;if(dialog)localStorage.setItem('read_at:'+(dialog.short_id||DIALOG_ID||SHORT_ID||dialog.id||''),String(dialog.updated_at||Date.now()));render();if(wasBottom&&!document.getElementById('search').value.trim())requestAnimationFrame(()=>scrollTo(0,document.body.scrollHeight))}catch(e){document.getElementById('chat').innerHTML='<div class="empty">Ошибка сети</div>'}}document.getElementById('search').addEventListener('input',render);load(true);setInterval(()=>load(false),2500)</script></body></html>`}
+function info(req){return `<body style="font-family:system-ui;background:#0d1b24;color:white;padding:24px"><div style="max-width:760px;margin:auto;background:#132634;padding:20px;border-radius:18px"><h2>FrodRobot работает ✅</h2><p>Сервер запущен.</p><p style="opacity:.75">Для просмотра чатов нужен секретный ключ.</p></div></body>`}
+function blocked(){return '<body style="font-family:system-ui;background:#101820;color:white;padding:30px"><h2>403 Forbidden</h2><p>Неверный key.</p></body>'}
+app.get('/',(req,res)=> okKey(req)?html(res,home(req)):html(res,info(req)) );
+app.get('/chat',(req,res)=> okKey(req)?html(res,(req.query.id||req.query.s)?chatPage(req):home(req)):html(res,blocked(),403));
+app.get('/c',(req,res)=> okKey(req)?html(res,chatPage(req)):html(res,blocked(),403));
+app.get('/api/chat',(req,res)=> okKey(req)?apiChat(req,res):json(res,{ok:false,error:'Forbidden'},403));
+app.get('/file',(req,res)=> okKey(req)?fileProxy(req,res):res.status(403).send('Forbidden'));
+app.get('/export',(req,res)=> okKey(req)?backup(req,res):json(res,{ok:false,error:'Forbidden'},403));
+app.get('/import',(req,res)=> okKey(req)?html(res,importPage(req)):html(res,blocked(),403));
+app.post('/import',(req,res)=> okKey(req)?restore(req,res):json(res,{ok:false,error:'Forbidden'},403));
+app.post('/webhook',async(req,res)=>{ if(SECRET_TOKEN && req.headers['x-telegram-bot-api-secret-token']!==SECRET_TOKEN) return res.status(403).send('Forbidden'); try{await update(req,req.body); return json(res,{ok:true})}catch(e){console.error(e); await owner('⚠️ <b>Ошибка Render/Neon Bot</b>\n\n<code>'+esc(String(e))+'</code>'); return json(res,{ok:true,error:String(e)})} });
+app.listen(PORT,()=>console.log('FrodRobot running on port '+PORT));
