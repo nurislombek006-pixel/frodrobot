@@ -71,7 +71,7 @@ async function findDialogForIdentity(connectionId,chatId,ownerId=''){
   const exact=await dialogMeta(`${connectionId||'normal'}:${chatId||'unknown_chat'}`);
   const identity=String(ownerId||'');
   if(identity){
-    const r=await q(`select id from dialogs where chat_id=$1 and owner->>'id'=$2 order by created_at asc limit 1`,[String(chatId||''),identity]);
+    const r=await q(`select d.id from dialogs d left join business_connections c on c.id=d.business_connection_id where d.chat_id=$1 and (d.owner->>'id'=$2 or c.user_id=$2) order by d.created_at asc limit 1`,[String(chatId||''),identity]);
     if(r.rows[0]?.id)return dialogMeta(r.rows[0].id);
   }
   return exact;
