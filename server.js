@@ -63,7 +63,7 @@ async function mergeDuplicateDialogs(){
 function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
 function attr(s){return esc(s).replaceAll('"','&quot;')}
 function json(res,d,st=200){return res.status(st).set('Cache-Control','no-store').json(d)}
-function html(res,t,st=200){return res.status(st).set('Content-Type','text/html; charset=utf-8').set('Cache-Control','no-store').send(t)}
+function html(res,t,st=200){const transitions='<style>@view-transition{navigation:auto}::view-transition-old(root){animation:page-out .14s ease both}::view-transition-new(root){animation:page-in .2s cubic-bezier(.2,.75,.25,1) both}@keyframes page-out{to{opacity:0;transform:translateY(-5px)}}@keyframes page-in{from{opacity:.7;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@media(prefers-reduced-motion:reduce){::view-transition-old(root),::view-transition-new(root){animation-duration:.01ms!important}}</style>';const page=String(t).replace('</head>',transitions+'</head>');return res.status(st).set('Content-Type','text/html; charset=utf-8').set('Cache-Control','no-store').send(page)}
 function now(){return Date.now()} function unix(){return Math.floor(Date.now()/1000)}
 function line(){return '━━━━━━━━━━━━━━'}
 function fmt(ts){ if(!ts) return 'неизвестно'; return new Intl.DateTimeFormat('ru-RU',{timeZone:'Asia/Tashkent',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(Number(ts)*1000)).replace(',',' •') }
