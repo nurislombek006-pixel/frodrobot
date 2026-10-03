@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import multer from 'multer';
 import { gzipSync } from 'node:zlib';
 import { telegramJson,telegramFile } from './lib/telegram.js';
+import { inboxPage } from './lib/inbox-page.js';
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -32,7 +33,8 @@ async function initDb(){
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_dialogs_updated ON dialogs(updated_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_message ON messages(message_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_dialog ON messages(dialog_id,date_ts,message_id);`);
-  await mergeDuplicateDialogs();
+  // Keep existing dialog rows untouched during startup; identity matching
+  // handles future updates without deleting historical chat records.
   console.log('✅ Database ready');
 }
 async function q(sql,p=[]){ await ready; return pool.query(sql,p); }
@@ -543,8 +545,8 @@ document.getElementById('fontDown').onclick=function(){scale=Math.max(.8,+(scale
 
 function info(req){return `<body style="font-family:system-ui;background:#0d1b24;color:white;padding:24px"><div style="max-width:760px;margin:auto;background:#132634;padding:20px;border-radius:18px"><h2>FrodRobot работает ✅</h2><p>Сервер запущен.</p><p style="opacity:.75">Для просмотра чатов нужен секретный ключ.</p></div></body>`}
 function blocked(){return '<body style="font-family:system-ui;background:#101820;color:white;padding:30px"><h2>403 Forbidden</h2><p>Неверный key.</p></body>'}
-app.get('/',(req,res)=> okKey(req)?html(res,homePageV3(req)):html(res,info(req)) );
-app.get('/chat',(req,res)=> okKey(req)?html(res,(req.query.id||req.query.s)?chatPageV2(req):homePageV3(req)):html(res,blocked(),403));
+app.get('/',(req,res)=> okKey(req)?html(res,inboxPage(req)):html(res,info(req)) );
+app.get('/chat',(req,res)=> okKey(req)?html(res,(req.query.id||req.query.s)?chatPageV2(req):inboxPage(req)):html(res,blocked(),403));
 app.get('/c',(req,res)=> okKey(req)?html(res,chatPageV2(req)):html(res,blocked(),403));
 app.get('/audit',(req,res)=> okKey(req)?html(res,auditPage(req)):html(res,blocked(),403));
 app.get('/api/chat',(req,res)=> okKey(req)?apiChat(req,res):json(res,{ok:false,error:'Forbidden'},403));
