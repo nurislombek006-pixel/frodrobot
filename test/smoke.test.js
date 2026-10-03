@@ -60,13 +60,13 @@ test('chat page inline JavaScript parses after server template values are filled
   assert.ok(start>0&&end>start,'chat page script boundaries exist');
   const script=source.slice(start+1,end).replace(/\$\{JSON\.stringify\([^}]+\)\}/g,'"test"');
   assert.doesNotThrow(()=>new Script(script));
-  const zoomStart=source.indexOf('</script><script>\nlet doubleTapRestore=',end);
+  const zoomStart=source.indexOf('</script><script>\nfunction setChatScale(',end);
   const zoomEnd=source.indexOf('\n</script>',zoomStart);
   assert.ok(zoomStart>0&&zoomEnd>zoomStart,'chat zoom script boundaries exist');
   assert.doesNotThrow(()=>new Script(source.slice(zoomStart+'</script><script>'.length,zoomEnd)));
   assert.match(source,/setChatScale\(scale-\.1\)/);
   assert.match(source,/setChatScale\(scale\+\.1\)/);
-  assert.match(source,/setChatScale\(1\.5\)/);
+  assert.doesNotMatch(source,/document\.addEventListener\('touchend'/);
 });
 
 test('responsive real inbox page uses the chat API and hides IDs in the list',()=>{
@@ -83,5 +83,6 @@ test('responsive real inbox page uses the chat API and hides IDs in the list',()
   assert.match(script,/Math\.max\(\.5,Math\.min\(1\.5/);
   assert.match(script,/От 50% до 150%/);
   assert.match(script,/frod-font-scale/);
+  assert.doesNotMatch(script,/touchend|DoubleTap/);
   assert.doesNotMatch(page,/const NM=|demo data|setInterval\(\(\)=>\{if\(!bot\)/i);
 });
