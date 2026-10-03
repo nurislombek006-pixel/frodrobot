@@ -84,5 +84,15 @@ test('responsive real inbox page uses the chat API and hides IDs in the list',()
   assert.match(script,/От 50% до 150%/);
   assert.match(script,/frod-font-scale/);
   assert.doesNotMatch(script,/touchend|DoubleTap/);
+  assert.match(page,/maximum-scale=1,user-scalable=no/);
+  assert.match(page,/touch-action:pan-x pan-y/);
   assert.doesNotMatch(page,/const NM=|demo data|setInterval\(\(\)=>\{if\(!bot\)/i);
+});
+
+test('pinch zoom is disabled on inbox and chat while text buttons remain',()=>{
+  assert.match(source,/maximum-scale=1,user-scalable=no/);
+  assert.match(source,/touch-action:pan-x pan-y/);
+  assert.match(source,/id="fontDown"/);
+  assert.match(source,/id="fontUp"/);
+  assert.doesNotMatch(source,/document\.addEventListener\('touchend'/);
 });
