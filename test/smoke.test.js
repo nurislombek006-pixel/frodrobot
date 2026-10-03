@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { Script } from 'node:vm';
+import { inboxPage } from '../lib/inbox-page.js';
 
 const source=await readFile(new URL('../server.js',import.meta.url),'utf8');
 
@@ -20,4 +22,56 @@ test('backup and audit features are present',()=>{
   assert.match(source,/runAutoBackup/);
   assert.match(source,/audit_events/);
   assert.match(source,/version:3/);
+});
+
+test('account summaries include chat totals and enabled state',()=>{
+  assert.match(source,/dialog_count/);
+  assert.match(source,/connected\?['"]on['"]:['"]off['"]/);
+  assert.match(source,/is_enabled/);
+});
+
+test('mobile chat home no longer exposes archive or journal',()=>{
+  const page=source.slice(source.indexOf('function homePageV3'),source.indexOf('function auditPage'));
+  assert.doesNotMatch(page,/Журнал действий|data-f="archive"|data-action="archive"|\['archived'/);
+  assert.match(page,/бот отключён/i);
+  assert.match(page,/чатов/);
+  assert.match(page,/data-view="chats"/);
+  assert.match(page,/data-view="accounts"/);
+  assert.match(page,/data-view="settings"/);
+  assert.match(page,/Telegram\.WebApp/);
+});
+
+test('chat history is paged to keep chat opening and polling lightweight',()=>{
+  assert.match(source,/const pageSize=Math\.max\(50,Math\.min\(Number\.parseInt\(req\.query\.limit\|\|'250',10\)\|\|250,500\)\)/);
+  assert.match(source,/d\.has_more=mr\.rows\.length>pageSize/);
+  assert.match(source,/const PAGE_SIZE=250/);
+  assert.match(source,/async function loadOlder\(\)/);
+});
+
+test('chat transitions respect reduced motion settings',()=>{
+  assert.match(source,/@view-transition\{navigation:auto\}/);
+  assert.match(source,/prefers-reduced-motion:reduce/);
+  assert.match(source,/::view-transition-new\(root\)/);
+});
+
+test('chat page inline JavaScript parses after server template values are filled',()=>{
+  const start=source.indexOf('\nconst DIALOG_ID=',source.indexOf('function chatPageV2'));
+  const end=source.indexOf('\n</script>',start);
+  assert.ok(start>0&&end>start,'chat page script boundaries exist');
+  const script=source.slice(start+1,end).replace(/\$\{JSON\.stringify\([^}]+\)\}/g,'"test"');
+  assert.doesNotThrow(()=>new Script(script));
+});
+
+test('responsive real inbox page uses the chat API and hides IDs in the list',()=>{
+  const page=inboxPage({query:{key:'test-key'}});
+  const script=page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  assert.doesNotThrow(()=>new Script(script));
+  assert.match(page,/grid-template-columns:minmax\(320px,390px\)/);
+  assert.match(page,/@media\(max-width:760px\)/);
+  assert.match(page,/\/api\/chat\?key=/);
+  assert.match(page,/\/c\?/);
+  assert.match(page,/Telegram ID/);
+  assert.match(script,/p\.short\|\|p\.name/);
+  assert.doesNotMatch(page,/const NM=|demo data|setInterval\(\(\)=>\{if\(!bot\)/i);
 });
