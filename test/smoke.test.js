@@ -54,6 +54,18 @@ test('chat transitions respect reduced motion settings',()=>{
   assert.match(source,/::view-transition-new\(root\)/);
 });
 
+test('chat motion is limited to new messages and actions use one delegated listener',()=>{
+  const chat=source.slice(source.indexOf('function chatPageV2'),source.indexOf('\nfunction info(req)'));
+  assert.match(chat,/message-arrive/);
+  assert.match(chat,/incoming=fresh\.filter/);
+  assert.match(chat,/root\.dataset\.actionsBound/);
+  assert.doesNotMatch(chat,/querySelectorAll\('\.action'\)/);
+  assert.match(chat,/cubic-bezier\(\.22,1,\.36,1\)/);
+  assert.match(chat,/prefers-reduced-motion:reduce/);
+  const inbox=inboxPage({query:{key:'test-key'}});
+  assert.match(inbox,/cubic-bezier\(\.22,1,\.36,1\)/);
+});
+
 test('chat page inline JavaScript parses after server template values are filled',()=>{
   const start=source.indexOf('\nconst DIALOG_ID=',source.indexOf('function chatPageV2'));
   const end=source.indexOf('\n</script>',start);
